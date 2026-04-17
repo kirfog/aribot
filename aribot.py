@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import json
-import logging
 import random
 import re
 import socket
@@ -17,55 +16,9 @@ from vosk import KaldiRecognizer, Model
 from websocket import WebSocket
 
 from ari import AsteriskARI
+from log import ColoredLogger
 
 config = SimpleNamespace(**dotenv_values(".env"))
-
-
-class ColorInjectedFilter(logging.Filter):
-    def filter(self, record):
-        if not hasattr(record, "color"):
-            record.color = ""
-        if not hasattr(record, "reset"):
-            record.reset = ""
-        return True
-
-
-handler = logging.StreamHandler()
-handler.addFilter(ColorInjectedFilter())
-formatter = logging.Formatter("%(color)s[%(levelname)s] %(name)s %(message)s%(reset)s")
-handler.setFormatter(formatter)
-logger_root = logging.getLogger()
-logger_root.addHandler(handler)
-logger_root.setLevel(logging.INFO)
-
-
-class ColoredLogger:
-    def __init__(self, name, color=None):
-        if color is None:
-            color_code = random.choice([39, 45, 75, 112, 170, 208, 214])
-        else:
-            color_code = color
-
-        self.color = f"\033[38;5;{color_code}m"
-        self.reset = "\033[0m"
-
-        base_logger = logging.getLogger(name)
-        self._adapter = logging.LoggerAdapter(
-            base_logger, {"color": self.color, "reset": self.reset}
-        )
-
-    def info(self, msg, *args, **kwargs):
-        self._adapter.info(msg, *args, **kwargs)
-
-    def error(self, msg, *args, **kwargs):
-        self._adapter.error(msg, *args, **kwargs)
-
-    def warning(self, msg, *args, **kwargs):
-        self._adapter.warning(msg, *args, **kwargs)
-
-    def debug(self, msg, *args, **kwargs):
-        self._adapter.debug(msg, *args, **kwargs)
-
 
 logger = ColoredLogger("MAIN", color=7)
 
@@ -117,6 +70,7 @@ class Aribot:
         voice: str = "baya",
         asterisk_host: str = config.ASTERHOST,
         asterisk_send_port: int = 0,
+        ari: AsteriskARI | None = None,
     ):
         self.ip = ip
         self.port = port
@@ -126,6 +80,9 @@ class Aribot:
         self.voice = voice
         self.asterisk_host = asterisk_host
         self.asterisk_send_port = asterisk_send_port
+        self.ari = ari
+        self.bridge_id: str | None = None
+        self.ext_channel_id: str | None = None
 
         self.rec = KaldiRecognizer(self.stt_model, 16000)
 
@@ -138,9 +95,17 @@ class Aribot:
         self.timestamp: int = 0
         self.ssrc = random.getrandbits(32)
         self.payload_type: int = 11
-        self.bridge_id: str | None = None
-        self.ext_channel_id: str | None = None
+
         self.logger = ColoredLogger("Aribot")
+
+        self.commands = {
+            "make_call": self.logger.info,
+            "play_sound": self.logger.info,
+        }
+
+        #     if self.ari:
+        #         self.ari.bridge_play_sound(self.bridge_id, "something-terribly-wrong")
+        #         self.ari.call_originate(call_from="100", call_to="108", context="local")
 
     def think(self, text: str) -> str:
         """
@@ -152,6 +117,7 @@ class Aribot:
         Returns:
             A string containing the processed output.
         """
+        self.logger.warning(f"USER: {text}")
         self.history += f"<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n"
         output = self.llm(
             self.history,
@@ -160,10 +126,19 @@ class Aribot:
         )
         llm_text = output["choices"][0]["text"].strip()  # type: ignore
 
-        self.history += f"{llm_text}<|im_end|>\n"
-        self.logger.warning(f"USER: {text}")
-        self.logger.warning(f"I: {llm_text}")
+        match = re.search(r"\[CALL:\s*(\w+)(?:\((.*?)\))?,\s*(.*?)\]", llm_text)
+        if match:
+            cmd_name = match.group(1)
+            cmd_arg = match.group(2)
+            voice_text = match.group(3)
+            if cmd_name in self.commands:
+                action_result = self.commands[cmd_name](cmd_arg)
+                if action_result:
+                    llm_text = voice_text
+
         llm_text = re.sub(r"[^а-яА-ЯёЁ0-9\s.,!?-]", "", llm_text)
+        self.history += f"{llm_text}<|im_end|>\n"
+        self.logger.warning(f"I: {llm_text}")
 
         if not llm_text:
             llm_text = config.NOANSWER
@@ -254,7 +229,6 @@ class Aribot:
                     if self.rec.AcceptWaveform(le_payload):
                         result = json.loads(self.rec.Result())
                         if result["text"]:
-                            self.logger.info(f"Recognized: {result['text']}")
                             thought = self.think(result["text"])
                             self.speak(thought)
                     # else:
@@ -271,7 +245,7 @@ class Aribot:
             self.logger.warning("No socket to listen")
 
     def stop(self):
-        logger.info("Stopping bot...")
+        self.logger.info("Stopping bot...")
         self.running = False
         time.sleep(0.2)
         if self.sock:
@@ -300,7 +274,7 @@ class AsteriskBotManager:
         self.start_port = audio_start_port
         self.sessions = {}  # dict[int, Aribot]
         self.port_counter: int = 0
-        self.logger = ColoredLogger("AsteriskBotManager", color=15)
+        self.logger = ColoredLogger("AsteriskBotManager", color=10)
 
     def _get_next_port(self):
         port = self.start_port + self.port_counter
@@ -351,6 +325,7 @@ class AsteriskBotManager:
                     self.audio_host,
                     port=dynamic_port,
                     asterisk_send_port=int(target_port),
+                    ari=self.ari,
                 )
                 self.sessions[ch_id] = bot
                 bot.bridge_id = bridge["id"]
@@ -360,7 +335,6 @@ class AsteriskBotManager:
             else:
                 self.logger.warning(f"No port to send audio: {ext_channel}")
 
-            # self.ari.bridge_play_sound(bridge["id"], "hello")
             # self.ari.bridge_play_sound(bridge["id"], "something-terribly-wrong")
 
         else:
@@ -401,7 +375,7 @@ class AsteriskBotManager:
             except Exception as e:
                 self.logger.warning(f"Cleanup error: {e}")
 
-        self.logger.info(f"Sessions: {self.sessions}")
+        self.logger.debug(f"Sessions: {self.sessions}")
 
     def handle_channel_entered_bridge(self, event: dict):
         """
@@ -438,15 +412,15 @@ class AsteriskBotManager:
             try:
                 self.ari = AsteriskARI(*self.ari_config)
                 self.ws = self.ari.create_websocket()
-                logging.info("WebSocket connected successfully")
+                self.logger.info("WebSocket connected successfully")
                 return
             except Exception as e:
-                logging.error(f"Connection failed: {e}. Retrying in 10s...")
+                self.logger.error(f"Connection failed: {e}. Retrying in 10s...")
                 time.sleep(10)
 
     def run(self):
         """
-        Starts the main event loop to monitor and maintains a persistent
+        Starts the main event loop and maintains a persistent
         WebSocket connection, listens for incoming ARI events and dispatches
         them to their respective handlers.
         """
@@ -469,16 +443,16 @@ class AsteriskBotManager:
                     elif event["type"] == "ChannelEnteredBridge":
                         self.handle_channel_entered_bridge(event)
                 else:
-                    logger.error("Websocket is not connected!")
+                    self.logger.error("Websocket is not connected!")
                     return
 
             except KeyboardInterrupt:
-                logger.info("Stopping Manager...")
+                self.logger.info("Stopping Manager...")
                 if self.ws:
                     self.ws.close()
                 break
             except Exception as e:
-                logger.error(f"Runtime error: {e}")
+                self.logger.error(f"Runtime error: {e}")
                 self.connect()
 
 
