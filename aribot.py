@@ -71,6 +71,7 @@ class Aribot:
         asterisk_host: str = config.ASTERHOST,
         asterisk_send_port: int = 0,
         ari: AsteriskARI | None = None,
+        caller: dict = {},
     ):
         self.ip = ip
         self.port = port
@@ -83,6 +84,7 @@ class Aribot:
         self.ari = ari
         self.bridge_id: str | None = None
         self.ext_channel_id: str | None = None
+        self.caller = {}
 
         self.rec = KaldiRecognizer(self.stt_model, 16000)
 
@@ -98,14 +100,7 @@ class Aribot:
 
         self.logger = ColoredLogger("Aribot")
 
-        self.commands = {
-            "make_call": self.logger.info,
-            "play_sound": self.logger.info,
-        }
-
-        #     if self.ari:
-        #         self.ari.bridge_play_sound(self.bridge_id, "something-terribly-wrong")
-        #         self.ari.call_originate(call_from="100", call_to="108", context="local")
+        self.commands = {}
 
     def think(self, text: str) -> str:
         """
@@ -257,6 +252,23 @@ class Aribot:
                 logger.error(f"Error closing socket: {e}")
 
 
+class AribotActor(Aribot):
+    def __init__(self, ip: str, port: int, **kwargs):
+        super().__init__(ip, port, **kwargs)
+        self.commands = {"make_call": self.make_call}
+
+    def make_call(self, number: str):
+        if self.ari:
+            self.ari.call_originate(
+                call_from=self.caller["number"], call_to=number, context="local"
+            )
+            # new_channel = self.ari.app_channel_create("108")
+            # if new_channel:
+            #    self.ari.bridge_add_channel(self.bridge_id, new_channel["id"])
+            #
+            # use a guard word to stop responding to all sounds in bridge
+
+
 class AsteriskBotManager:
     def __init__(
         self,
@@ -321,7 +333,7 @@ class AsteriskBotManager:
             self.ari.bridge_add_channel(bridge["id"], ext_channel["id"])
 
             if target_port:
-                bot = Aribot(
+                bot = AribotActor(
                     self.audio_host,
                     port=dynamic_port,
                     asterisk_send_port=int(target_port),
@@ -330,6 +342,7 @@ class AsteriskBotManager:
                 self.sessions[ch_id] = bot
                 bot.bridge_id = bridge["id"]
                 bot.ext_channel_id = ext_channel["id"]
+                bot.caller = event["channel"]["caller"]
                 threading.Thread(target=bot.listen, daemon=True).start()
 
             else:
