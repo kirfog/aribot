@@ -9,14 +9,13 @@ import time
 from types import SimpleNamespace
 
 import numpy as np
+import sherpa_onnx
 import torch
+from ari import AsteriskARI
 from dotenv import dotenv_values
 from llama_cpp import Llama
-from vosk import KaldiRecognizer, Model
-from websocket import WebSocket
-
-from ari import AsteriskARI
 from log import ColoredLogger
+from websocket import WebSocket
 
 config = SimpleNamespace(**dotenv_values(".env"))
 
@@ -26,11 +25,6 @@ sessions = {}
 ari = None
 ws = None
 
-logger.info("Loading STT model to listen")
-stt_model = Model(config.MODEL_STT_PATH)
-logger.info("-" * 50 + "\n")
-
-logger.info("Loading LLM model to think")
 llm = Llama(
     model_path=config.MODEL_LLM_PATH,
     n_ctx=4096,
@@ -38,9 +32,7 @@ llm = Llama(
     n_threads_batch=8,
     verbose=False,
 )
-logger.info("-" * 50 + "\n")
 
-logger.info("Loading TTS model to speak")
 device = torch.device("cpu")  # type: ignore
 torch.set_num_threads(4)  # type: ignore
 
@@ -53,10 +45,6 @@ tts_model, _ = torch.hub.load(
 )  # type: ignore
 
 tts_model.to(device)
-logger.info("-" * 50 + "\n")
-
-logger.info(f"Models are loaded\nSTT: {stt_model}\nLLM: {llm}\nTTS: {tts_model}")
-logger.info("-" * 50 + "\n")
 
 
 class Aribot:
@@ -64,7 +52,6 @@ class Aribot:
         self,
         ip: str,
         port: int,
-        stt_model: Model = stt_model,
         tts_model=tts_model,
         llm: Llama = llm,
         voice: str = "baya",
@@ -75,7 +62,6 @@ class Aribot:
     ):
         self.ip = ip
         self.port = port
-        self.stt_model = stt_model
         self.tts_model = tts_model
         self.llm = llm
         self.voice = voice
@@ -86,7 +72,31 @@ class Aribot:
         self.ext_channel_id: str | None = None
         self.caller = {}
 
-        self.rec = KaldiRecognizer(self.stt_model, 16000)
+        self.rec = self.recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
+            tokens=f"{config.MODEL_STT_PATH}/tokens.txt",
+            encoder=f"{config.MODEL_STT_PATH}/encoder.onnx",
+            decoder=f"{config.MODEL_STT_PATH}/decoder.onnx",
+            joiner=f"{config.MODEL_STT_PATH}/joiner.onnx",
+            num_threads=1,
+            model_type="zipformer2",
+            enable_endpoint_detection=True,
+            rule1_min_trailing_silence=1.2,
+        )
+
+        self.stt_stream = self.recognizer.create_stream()
+
+        # self.tts_config = sherpa_onnx.OfflineTtsConfig(
+        #     model=sherpa_onnx.OfflineTtsModelConfig(
+        #         vits=sherpa_onnx.OfflineTtsVitsModelConfig(
+        #             model="vits-piper-ru_RU-irina-medium/ru_RU-irina-medium.onnx",
+        #             tokens="vits-piper-ru_RU-irina-medium/tokens.txt",
+        #             data_dir="vits-piper-ru_RU-irina-medium/espeak-ng-data",
+        #         ),
+        #         num_threads=1,  # Start with 1 to save memory
+        #         debug=True,  # This will print where exactly it crashes
+        #     )
+        # )
+        # self.tts = sherpa_onnx.OfflineTts(config)
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -160,6 +170,10 @@ class Aribot:
         # 16-bit integers in Big-Endian format (standard for RTP L16) ">i2"
         audio_bytes = (audio_tensor * 32767).numpy().astype(">i2").tobytes()
 
+        # audio = self.tts.generate(text=text, sid=0)
+        # samples = np.array(audio.samples, dtype=np.float32)
+        # audio_bytes = (samples * 32767).astype(">i2").tobytes()
+
         try:
             # Standard RTP packet size: 20ms of audio  8000Hz: 160 samples 16000Hz: 320 samples * 2 bytes per sample
             # chunk_size = 320
@@ -211,29 +225,32 @@ class Aribot:
         self.logger.info(
             f"Starting ARIBot {self.ip}:{self.port} <=> {self.asterisk_host}:{self.asterisk_send_port}"
         )
-        self.rec = KaldiRecognizer(self.stt_model, 16000)
+
         if self.sock:
             try:
                 while True:
                     data, addr = self.sock.recvfrom(2048)
                     payload = data[12:]
-                    le_payload = (
-                        np.frombuffer(payload, dtype=">i2").astype("<i2").tobytes()
+                    samples = (
+                        np.frombuffer(payload, dtype=">i2").astype(np.float32) / 32768.0
                     )
+                    self.stt_stream.accept_waveform(16000, samples)
 
-                    if self.rec.AcceptWaveform(le_payload):
-                        result = json.loads(self.rec.Result())
-                        if result["text"]:
-                            thought = self.think(result["text"])
+                    while self.recognizer.is_ready(self.stt_stream):
+                        self.recognizer.decode_stream(self.stt_stream)
+
+                    if self.recognizer.is_endpoint(self.stt_stream):
+                        result = self.recognizer.get_result(self.stt_stream)
+                        if result:
+                            self.logger.debug(f"Recognized: {result}")
+                            thought = self.think(result)
                             self.speak(thought)
-                    # else:
-                    #     logger.debug(
-                    #         f"Partial result: {json.loads(self.rec.PartialResult())}"
-                    #     )
+
+                        self.recognizer.reset(self.stt_stream)
 
             except KeyboardInterrupt:
-                final_result = json.loads(self.rec.FinalResult())
-                self.logger.debug(f"Recognized: {final_result['text']}")
+                final_result = self.recognizer.get_result(self.stt_stream)
+                self.logger.debug(f"Final Recognized: {final_result}")
             finally:
                 self.sock.close()
         else:
