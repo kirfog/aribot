@@ -7,44 +7,40 @@ import struct
 import threading
 import time
 from types import SimpleNamespace
+from typing import Any
 
+import num2words
 import numpy as np
 import sherpa_onnx
-import torch
 from ari import AsteriskARI
 from dotenv import dotenv_values
 from llama_cpp import Llama
 from log import ColoredLogger
+from torch._C import device, set_num_threads
+from torch.package.package_importer import PackageImporter
 from websocket import WebSocket
 
 config = SimpleNamespace(**dotenv_values(".env"))
 
 logger = ColoredLogger("MAIN", color=7)
 
-sessions = {}
 ari = None
 ws = None
 
 llm = Llama(
     model_path=config.MODEL_LLM_PATH,
-    n_ctx=4096,
+    n_ctx=2048,
     n_threads=8,
     n_threads_batch=8,
     verbose=False,
 )
 
-device = torch.device("cpu")  # type: ignore
-torch.set_num_threads(4)  # type: ignore
-
-tts_model, _ = torch.hub.load(
-    repo_or_dir="snakers4/silero-models",
-    model="silero_tts",
-    language="ru",
-    speaker="v4_ru",
-    trust_repo="true",
-)  # type: ignore
-
-tts_model.to(device)
+dev = device("cpu")
+set_num_threads(4)
+tts_model = PackageImporter(config.MODEL_SILERO_TTS_PATH).load_pickle(
+    "tts_models", "model"
+)
+tts_model.to(dev)
 
 
 class Aribot:
@@ -52,7 +48,7 @@ class Aribot:
         self,
         ip: str,
         port: int,
-        tts_model=tts_model,
+        tts_model: Any = tts_model,
         llm: Llama = llm,
         voice: str = "baya",
         asterisk_host: str = config.ASTERHOST,
@@ -88,15 +84,14 @@ class Aribot:
         # self.tts_config = sherpa_onnx.OfflineTtsConfig(
         #     model=sherpa_onnx.OfflineTtsModelConfig(
         #         vits=sherpa_onnx.OfflineTtsVitsModelConfig(
-        #             model="vits-piper-ru_RU-irina-medium/ru_RU-irina-medium.onnx",
-        #             tokens="vits-piper-ru_RU-irina-medium/tokens.txt",
-        #             data_dir="vits-piper-ru_RU-irina-medium/espeak-ng-data",
+        #             model=f"{config.MODEL_TTS_PATH}/model.onnx",
+        #             tokens=f"{config.MODEL_TTS_PATH}/tokens.txt",
+        #             data_dir=f"{config.MODEL_TTS_PATH}/espeak-ng-data",
         #         ),
-        #         num_threads=1,  # Start with 1 to save memory
-        #         debug=True,  # This will print where exactly it crashes
+        #         num_threads=1,
         #     )
         # )
-        # self.tts = sherpa_onnx.OfflineTts(config)
+        # self.tts = sherpa_onnx.OfflineTts(self.tts_config)
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -114,13 +109,17 @@ class Aribot:
 
     def think(self, text: str) -> str:
         """
-        Processes the input text and generates a thoughtful response.
+        Processes user input to generate a response or execute commands.
+
+        Appends the input to the conversation history and queries the LLM.
+        A command pattern: [CALL: command(arg), voice_text]
 
         Args:
-            text: The input string to analyze or respond to.
+            text: The raw user input string to be processed.
 
         Returns:
-            A string containing the processed output.
+            A string containing either the voice response for the executed command
+            or the standard LLM text output.
         """
         self.logger.warning(f"USER: {text}")
         self.history += f"<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n"
@@ -141,7 +140,6 @@ class Aribot:
                 if action_result:
                     llm_text = voice_text
 
-        llm_text = re.sub(r"[^а-яА-ЯёЁ0-9\s.,!?-]", "", llm_text)
         self.history += f"{llm_text}<|im_end|>\n"
         self.logger.warning(f"I: {llm_text}")
 
@@ -163,26 +161,39 @@ class Aribot:
             self.logger.warning("No Asterisk port set")
             return
 
+        text = re.sub(
+            r"\d+",
+            lambda m: num2words.num2words(int(m.group(0)), lang=config.LANGUAGE),
+            text,
+        )
+
+        sample_rate = 8000  # for 16 use WebSocket https://community.asterisk.org/t/ari-external-media-code-issue/110111/11
+
         audio_tensor = self.tts_model.apply_tts(
-            text=text, speaker=self.voice, sample_rate=8000
+            text=text, speaker=self.voice, sample_rate=sample_rate
         )
 
         # 16-bit integers in Big-Endian format (standard for RTP L16) ">i2"
         audio_bytes = (audio_tensor * 32767).numpy().astype(">i2").tobytes()
 
+        # sherpa speaks
         # audio = self.tts.generate(text=text, sid=0)
-        # samples = np.array(audio.samples, dtype=np.float32)
-        # audio_bytes = (samples * 32767).astype(">i2").tobytes()
+        # input_samples = np.array(audio.samples, dtype=np.float32)
+        # num_samples_new = int(len(input_samples) * sample_rate / audio.sample_rate)
+        # x_old = np.arange(len(input_samples))
+        # x_new = np.linspace(0, len(input_samples) - 1, num_samples_new)
+        # audio_tensor = np.interp(x_new, x_old, input_samples)
+        # audio_bytes = (audio_tensor * 32767).astype(">i2").tobytes()
 
         try:
             # Standard RTP packet size: 20ms of audio  8000Hz: 160 samples 16000Hz: 320 samples * 2 bytes per sample
-            # chunk_size = 320
-            # samples_per_chunk = 160
-            chunk_size = 640
-            samples_per_chunk = 320
+            chunk_size = 320
+            samples_per_chunk = 160
+            # chunk_size = 640
+            # samples_per_chunk = 320
             start_time = time.time()
 
-            for i in range(0, len(audio_bytes), chunk_size):
+            for frame_idx, i in enumerate(range(0, len(audio_bytes), chunk_size)):
                 chunk = audio_bytes[i : i + chunk_size]
 
                 if len(chunk) < chunk_size:
@@ -204,7 +215,7 @@ class Aribot:
                     )
                     self.seq_num = (self.seq_num + 1) & 0xFFFF
                     self.timestamp = (self.timestamp + samples_per_chunk) & 0xFFFFFFFF
-                    expected_time = start_time + (i / chunk_size + 1) * 0.02
+                    expected_time = start_time + ((frame_idx + 1) * 0.02)
                     sleep_time = expected_time - time.time()
                     if sleep_time > 0:
                         time.sleep(sleep_time)
