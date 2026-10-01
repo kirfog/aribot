@@ -125,7 +125,7 @@ class Aribot:
         self.history += f"<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n"
         output = self.llm(
             self.history,
-            max_tokens=128,
+            max_tokens=1024,
             echo=False,
         )
         llm_text = output["choices"][0]["text"].strip()  # type: ignore
@@ -170,7 +170,13 @@ class Aribot:
         sample_rate = 8000  # for 16 use WebSocket https://community.asterisk.org/t/ari-external-media-code-issue/110111/11
 
         audio_tensor = self.tts_model.apply_tts(
-            text=text, speaker=self.voice, sample_rate=sample_rate
+            text=text,
+            speaker=self.voice,
+            sample_rate=sample_rate,
+            put_accent=True,
+            put_yo=True,
+            put_stress_homo=True,
+            put_yo_homo=True,
         )
 
         # 16-bit integers in Big-Endian format (standard for RTP L16) ">i2"
@@ -345,13 +351,13 @@ class AsteriskBotManager:
             self.ari.answer_call(ch_id)
             bridge = self.ari.bridge_create(f"bridge-{ch_id}")
 
-            ext_channel = self.ari.external_media_channel_create(
+            ext_channel = self.ari.external_ws_media_channel_create(
                 host=self.audio_host,
                 port=dynamic_port,
                 format="slin16",
                 direction="both",
             )
-            self.logger.debug(f"External medeia channel: {ext_channel}")
+            self.logger.info(f"External medeia channel: {ext_channel}")
 
             target_port = ext_channel.get("channelvars", {}).get(
                 "UNICASTRTP_LOCAL_PORT"
